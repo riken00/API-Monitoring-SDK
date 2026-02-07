@@ -2,8 +2,7 @@
 
 import threading
 import time
-import requests
-from queue import Queue
+from queue import Queue, Empty
 from typing import Optional, Dict, List
 
 class MetricSender:
@@ -45,7 +44,7 @@ class MetricSender:
                    (time.time() - self.last_send) >= self.config.batch_timeout:
                     self._flush()
                     
-            except:
+            except Empty:
                 # Timeout - check if we should flush anyway
                 if self.batch and (time.time() - self.last_send) >= self.config.batch_timeout:
                     self._flush()
@@ -56,24 +55,39 @@ class MetricSender:
             return
         
         try:
-            response = requests.post(
+            # ← CRITICAL FIX: Use urllib3 instead of requests to avoid infinite loop
+            import urllib3
+            import json
+            
+            http = urllib3.PoolManager()
+            
+            # ← FIXED: Backend expects api_key in JSON body, not header
+            payload = {
+                'api_key': self.config.api_key,
+                'metrics': self.batch
+            }
+            
+            response = http.request(
+                'POST',
                 self.config.endpoint,
-                json={'metrics': self.batch},
-                headers={'X-API-Key': self.config.api_key},
-                timeout=10
+                body=json.dumps(payload),
+                headers={'Content-Type': 'application/json'},
+                timeout=10.0
             )
-            response.raise_for_status()
             
-            if self.config.debug:
-                print(f"[APIMonitor] Sent {len(self.batch)} metrics")
-            
-            # Clear batch
-            self.batch = []
-            self.last_send = time.time()
-            
-            # Try to flush offline queue
-            if self.offline_queue:
-                self._flush_offline()
+            if response.status == 200:
+                if self.config.debug:
+                    print(f"[APIMonitor] Sent {len(self.batch)} metrics")
+                
+                # Clear batch
+                self.batch = []
+                self.last_send = time.time()
+                
+                # Try to flush offline queue
+                if self.offline_queue:
+                    self._flush_offline()
+            else:
+                raise Exception(f"HTTP {response.status}: {response.data.decode()[:200]}")
                 
         except Exception as e:
             # Save to offline queue
@@ -87,16 +101,33 @@ class MetricSender:
     
     def _flush_offline(self):
         """Send metrics from offline queue"""
+        if not self.offline_queue:
+            return
+            
         offline_batch = self.offline_queue.get_batch(100)
         if offline_batch:
             try:
-                response = requests.post(
+                import urllib3
+                import json
+                
+                http = urllib3.PoolManager()
+                
+                payload = {
+                    'api_key': self.config.api_key,
+                    'metrics': offline_batch
+                }
+                
+                response = http.request(
+                    'POST',
                     self.config.endpoint,
-                    json={'metrics': offline_batch},
-                    headers={'X-API-Key': self.config.api_key},
-                    timeout=10
+                    body=json.dumps(payload),
+                    headers={'Content-Type': 'application/json'},
+                    timeout=10.0
                 )
-                response.raise_for_status()
-                self.offline_queue.clear_batch(len(offline_batch))
+                
+                if response.status == 200:
+                    self.offline_queue.clear_batch(len(offline_batch))
+                    if self.config.debug:
+                        print(f"[APIMonitor] Flushed {len(offline_batch)} offline metrics")
             except:
                 pass  # Will retry later

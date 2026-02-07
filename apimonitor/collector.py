@@ -2,7 +2,6 @@
 
 import time
 import random
-from datetime import datetime
 from typing import Optional, Dict, Any
 
 def collect_metric(
@@ -26,19 +25,17 @@ def collect_metric(
     response_time = (time.time() - start_time) * 1000  # ms
     
     metric = {
-        'timestamp': datetime.utcnow().isoformat() + 'Z',
-        'library': library,
+        'timestamp': start_time,  # ← FIXED: Use float timestamp, not ISO string
         'method': method.upper(),
         'url': url,
-        'response_time_ms': round(response_time, 2)
+        'duration_ms': round(response_time, 2)  # ← FIXED: Renamed from response_time_ms
     }
     
     if response:
-        metric['status_code'] = response.status_code
-        metric['response_size'] = len(response.content) if hasattr(response, 'content') else None
+        metric['status_code'] = getattr(response, 'status_code', None)
     
     if error:
-        metric['error_message'] = str(error)
+        metric['error'] = str(error)
         metric['status_code'] = None
     
     return metric
