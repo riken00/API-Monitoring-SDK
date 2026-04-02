@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="api-monitor-sdk",
-    version="0.1.2",
+    version="0.1.3",
     author="riken-khadela",
     author_email="rikenkhadela777@gmail.com",
     description="Automatic HTTP request monitoring for Python applications",

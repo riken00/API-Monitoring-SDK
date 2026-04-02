@@ -1,198 +1,406 @@
 """
-Monkey-patches requests, httpx, aiohttp to auto-collect metrics
+interceptor.py — Monkey-patches outgoing HTTP libraries.
+
+Supported: requests, httpx, urllib3 (direct usage).
+
+KEY CHANGE from original:
+  When enable_validation=True, the metric is piggybacked onto the /validate
+  call as the `metric` field — /ingest is NOT called separately.
+  One network round-trip handles both Flow 1 (decision) and Flow 2 (capture).
+
+  When enable_validation=False and enable_ingest=True:
+  Metric is queued for background /ingest as before.
+
+  This means the SDK NEVER makes two separate calls to the backend per request.
+
+install() returns a list of successfully patched library names so
+monitor.diagnose() can report which ones are active.
 """
+
+from __future__ import annotations
 
 import time
 from functools import wraps
-from .collector import collect_metric
+from typing import List, Optional
 
-_original_funcs = {}
+from .collector import build_metric
+from .logger import get_logger
 
-def install_interceptors(config, sender):
-    """Patch all supported HTTP libraries"""
-    _patch_requests(config, sender)
-    _patch_httpx(config, sender)
+_originals = {}
 
-def uninstall_interceptors():
-    """Restore original functions"""
-    for (lib, attr), original in _original_funcs.items():
-        setattr(lib, attr, original)
-    _original_funcs.clear()
 
-def _should_ignore(url: str, config) -> bool:
-    """Check if URL should be ignored (our own monitoring backend)"""
-    base_url = config.endpoint.rsplit('/', 1)[0]
-    return url.startswith(base_url)
+def install(config, sender, validator) -> List[str]:
+    """Patch all available HTTP libraries. Returns list of patched library names."""
+    patched = []
+    if _patch_requests(config, sender, validator):  patched.append("requests")
+    if _patch_httpx(config, sender, validator):     patched.append("httpx")
+    if _patch_urllib3(config, sender, validator):   patched.append("urllib3")
+    return patched
 
-def _patch_requests(config, sender):
-    """Patch requests library"""
+
+def uninstall() -> None:
+    """Restore all original functions."""
+    for (obj, attr), original in _originals.items():
+        setattr(obj, attr, original)
+    _originals.clear()
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _is_own_url(url: str, config) -> bool:
+    """
+    Skip monitoring calls to our own platform — prevents infinite loops.
+    Checks exact base_url prefix, case-insensitive scheme.
+    """
+    own = config.base_url.rstrip("/")
+    return url.startswith(own) or url.lower().startswith(own.lower())
+
+
+def _is_excluded(url: str, config) -> bool:
+    """Check path exclusion rules (exact match or wildcard prefix)."""
+    try:
+        from urllib.parse import urlparse
+        path = urlparse(url).path
+    except Exception:
+        path = url
+
+    for rule in config.exclude:
+        if rule.endswith("*"):
+            if path.startswith(rule[:-1]):
+                return True
+        elif path == rule:
+            return True
+    return False
+
+
+def _blocked_response(validation_result, log):
+    """Build a minimal blocked-response object compatible with requests/httpx."""
+    import json
+
+    class _BlockedResponse:
+        status_code = validation_result.status_code
+        headers     = {"Content-Type": "application/json"}
+
+        def __init__(self, body: bytes):
+            self._body = body
+
+        @property
+        def text(self) -> str:
+            return self._body.decode("utf-8")
+
+        @property
+        def content(self) -> bytes:
+            return self._body
+
+        def json(self):
+            return json.loads(self._body)
+
+    body = validation_result.deny_response_body()
+    log.info("Request blocked — status=%s reason=%s",
+             validation_result.status_code, validation_result.reason)
+    return _BlockedResponse(body)
+
+
+def _handle_request(
+    *,
+    config,
+    sender,
+    validator,
+    library: str,
+    method: str,
+    url: str,
+    start_time: float,
+    response=None,
+    error=None,
+    request_headers=None,
+    request_body=None,
+    identity_id: str = "",
+) -> None:
+    """
+    Shared post-request logic for all three libraries.
+
+    If enable_validation=True:
+      The metric was already piggybacked on the /validate call BEFORE the
+      request executed (see each patch below). Nothing to do here.
+
+    If enable_validation=False and enable_ingest=True:
+      Build metric and queue it for background /ingest.
+    """
+    if config.enable_validation:
+        # Already handled via piggybacked metric in validate call
+        return
+
+    if config.enable_ingest:
+        metric = build_metric(
+            library=library,
+            method=method,
+            url=url,
+            start_time=start_time,
+            response=response,
+            error=error,
+            config=config,
+            request_headers=request_headers,
+            request_body=request_body,
+        )
+        if metric:
+            sender.add_metric(metric)
+
+
+def _validate_with_metric(
+    *,
+    config,
+    validator,
+    sender,
+    library: str,
+    method: str,
+    url: str,
+    start_time: float,
+    response=None,
+    error=None,
+    request_headers=None,
+    request_body=None,
+):
+    """
+    Combined Flow 1 + Flow 2:
+    Calls validator.check() with the metric pre-attached as pending_metric.
+    The backend will save the metric inside the /validate handler — no
+    separate /ingest call needed.
+
+    Returns ValidationResult.
+    """
+    # Build the metric dict to piggyback
+    pending = None
+    if config.enable_ingest:
+        pending = build_metric(
+            library=library,
+            method=method,
+            url=url,
+            start_time=start_time,
+            response=response,
+            error=error,
+            config=config,
+            request_headers=request_headers,
+            request_body=request_body,
+        )
+
+    return validator.check(
+        method=method,
+        url=url,
+        headers=request_headers or {},
+        pending_metric=pending,
+    )
+
+
+# ── requests ──────────────────────────────────────────────────────────────────
+
+def _patch_requests(config, sender, validator) -> bool:
     try:
         import requests
-        import urllib.request
-        import json
-        
+        log      = get_logger(config.log_level, config.debug)
         original = requests.Session.request
-        
+
         @wraps(original)
-        def monitored_request(self, method, url, **kwargs):
-            # CRITICAL: Skip monitoring our own backend
-            if _should_ignore(url, config):
+        def monitored(self, method, url, **kwargs):
+            if _is_own_url(url, config) or _is_excluded(url, config):
                 return original(self, method, url, **kwargs)
-            
-            # --- START VALIDATION ---
-            # Call the monitoring backend to validate BEFORE making the actual request
-            try:
-                # Determine validation URL
-                base_url = config.endpoint.rsplit('/', 1)[0]
-                validate_url = f"{base_url}/validate"
-                
-                # Prepare validation payload
-                val_payload = {
-                    "api_key": config.api_key,
-                    "method": method.upper(),
-                    "url": str(url)
-                }
-                
-                if config.debug:
-                    print(f"🔐 [SDK] Validating with monitoring backend: {method} {url}")
-                
-                # Use urllib to avoid circular dependency with requests
-                req = urllib.request.Request(
-                    validate_url,
-                    data=json.dumps(val_payload).encode('utf-8'),
-                    headers={'Content-Type': 'application/json'},
-                    method='POST'
-                )
-                
-                try:
-                    with urllib.request.urlopen(req, timeout=2.0) as response:
-                        val_response = json.loads(response.read().decode('utf-8'))
-                        if config.debug:
-                            print(f"   ✅ [SDK] Validation passed: {val_response.get('message', 'OK')}")
-                except urllib.error.HTTPError as e:
-                    # Validation failed - read error details
-                    error_body = e.read().decode('utf-8')
-                    try:
-                        error_data = json.loads(error_body)
-                        error_msg = error_data.get('detail', 'Request blocked by monitoring policy')
-                    except:
-                        error_msg = f"Request blocked (HTTP {e.code})"
-                    
-                    if config.debug:
-                        print(f"   ❌ [SDK] Validation FAILED: {error_msg}")
-                    
-                    # Create a mock response object to return to the caller
-                    class BlockedResponse:
-                        def __init__(self, status_code, message):
-                            self.status_code = status_code
-                            self.text = json.dumps({"error": message, "blocked_by": "api_monitor"})
-                            self.headers = {'Content-Type': 'application/json'}
-                            self._content = self.text.encode('utf-8')
-                        
-                        def json(self):
-                            return json.loads(self.text)
-                        
-                        @property
-                        def content(self):
-                            return self._content
-                    
-                    # Return blocked response WITHOUT calling the actual API
-                    blocked_resp = BlockedResponse(e.code, error_msg)
-                    
-                    # Still collect metrics for blocked requests
-                    metric = collect_metric(
-                        'requests', method, url, time.time(), blocked_resp, None, config
+
+            req_headers = kwargs.get("headers") or {}
+            req_body    = kwargs.get("data") or kwargs.get("json")
+            start       = time.time()
+
+            # ── Flow 1: Validation (with piggybacked metric) ───────────────
+            if config.enable_validation:
+                # Build metric from pre-request info (no response yet)
+                pending = None
+                if config.enable_ingest:
+                    pending = build_metric(
+                        library="requests",
+                        method=method, url=url,
+                        start_time=start,
+                        response=None, error=None,
+                        config=config,
+                        request_headers=req_headers,
+                        request_body=req_body,
                     )
-                    if metric:
-                        sender.add_metric(metric)
-                    
-                    return blocked_resp
-                    
-            except Exception as e:
-                # If validation service is down, decide: fail open or fail closed
-                # Current implementation: FAIL CLOSED (strict validation)
-                if config.debug:
-                    print(f"   ⚠️  [SDK] Validation service error: {str(e)}")
-                    print(f"   ❌ [SDK] Request BLOCKED due to validation service unavailability")
-                
-                class ValidationErrorResponse:
-                    def __init__(self):
-                        self.status_code = 503
-                        self.text = json.dumps({
-                            "error": "API Monitoring service unavailable",
-                            "detail": "Cannot validate request"
-                        })
-                        self.headers = {'Content-Type': 'application/json'}
-                        self._content = self.text.encode('utf-8')
-                    
-                    def json(self):
-                        return json.loads(self.text)
-                    
-                    @property
-                    def content(self):
-                        return self._content
-                
-                return ValidationErrorResponse()
-            # --- END VALIDATION ---
-            
-            # Validation passed - proceed with actual request
-            if config.debug:
-                print(f"🚀 [SDK] Proceeding to client API: {method} {url}")
-            
-            start = time.time()
-            error = None
-            response = None
-            
+
+                result = validator.check(
+                    method=method, url=url,
+                    headers=req_headers,
+                    pending_metric=pending,
+                )
+                if not result.allowed:
+                    return _blocked_response(result, log)
+
+            # ── Execute the actual request ─────────────────────────────────
+            response = error = None
             try:
                 response = original(self, method, url, **kwargs)
                 return response
-            except Exception as e:
-                error = e
+            except Exception as exc:
+                error = exc
                 raise
             finally:
-                metric = collect_metric(
-                    'requests', method, url, start, response, error, config
-                )
-                if metric:
-                    sender.add_metric(metric)
-        
-        requests.Session.request = monitored_request
-        _original_funcs[(requests.Session, 'request')] = original
-    except ImportError:
-        pass
+                # ── Flow 2 only (validation=False) ─────────────────────────
+                if not config.enable_validation and config.enable_ingest:
+                    metric = build_metric(
+                        library="requests",
+                        method=method, url=url,
+                        start_time=start,
+                        response=response, error=error,
+                        config=config,
+                        request_headers=req_headers,
+                        request_body=req_body,
+                    )
+                    if metric:
+                        sender.add_metric(metric)
 
-def _patch_httpx(config, sender):
-    """Patch httpx library"""
+        requests.Session.request                    = monitored
+        _originals[(requests.Session, "request")]   = original
+        log.debug("Patched requests.Session.request")
+        return True
+    except ImportError:
+        return False
+
+
+# ── httpx ─────────────────────────────────────────────────────────────────────
+
+def _patch_httpx(config, sender, validator) -> bool:
     try:
         import httpx
+        log      = get_logger(config.log_level, config.debug)
         original = httpx.Client.send
-        
+
         @wraps(original)
-        def monitored_send(self, request, **kwargs):
-            url = str(request.url)
-            
-            # ← CRITICAL: Ignore our own monitoring backend
-            if _should_ignore(url, config):
+        def monitored(self, request, **kwargs):
+            url         = str(request.url)
+            if _is_own_url(url, config) or _is_excluded(url, config):
                 return original(self, request, **kwargs)
-            
-            start = time.time()
-            error = None
-            response = None
-            
+
+            req_headers = dict(request.headers)
+            req_body    = request.content
+            start       = time.time()
+
+            # ── Flow 1: Validation (with piggybacked metric) ───────────────
+            if config.enable_validation:
+                pending = None
+                if config.enable_ingest:
+                    pending = build_metric(
+                        library="httpx",
+                        method=request.method, url=url,
+                        start_time=start,
+                        response=None, error=None,
+                        config=config,
+                        request_headers=req_headers,
+                        request_body=req_body,
+                    )
+
+                result = validator.check(
+                    method=request.method, url=url,
+                    headers=req_headers,
+                    pending_metric=pending,
+                )
+                if not result.allowed:
+                    return _blocked_response(result, log)
+
+            # ── Execute the actual request ─────────────────────────────────
+            response = error = None
             try:
                 response = original(self, request, **kwargs)
                 return response
-            except Exception as e:
-                error = e
+            except Exception as exc:
+                error = exc
                 raise
             finally:
-                metric = collect_metric(
-                    'httpx', request.method, url, start, response, error, config
-                )
-                if metric:
-                    sender.add_metric(metric)
-        
-        httpx.Client.send = monitored_send
-        _original_funcs[(httpx.Client, 'send')] = original
+                if not config.enable_validation and config.enable_ingest:
+                    metric = build_metric(
+                        library="httpx",
+                        method=request.method, url=url,
+                        start_time=start,
+                        response=response, error=error,
+                        config=config,
+                        request_headers=req_headers,
+                        request_body=req_body,
+                    )
+                    if metric:
+                        sender.add_metric(metric)
+
+        httpx.Client.send                       = monitored
+        _originals[(httpx.Client, "send")]      = original
+        log.debug("Patched httpx.Client.send")
+        return True
     except ImportError:
-        pass
+        return False
+
+
+# ── urllib3 ───────────────────────────────────────────────────────────────────
+
+def _patch_urllib3(config, sender, validator) -> bool:
+    try:
+        import urllib3
+        log      = get_logger(config.log_level, config.debug)
+        original = urllib3.HTTPConnectionPool.urlopen
+
+        @wraps(original)
+        def monitored(self, method, url, **kwargs):
+            # urllib3 gives us path only — reconstruct full URL
+            port     = f":{self.port}" if self.port not in (80, 443, None) else ""
+            scheme   = "https" if self.port == 443 else "http"
+            full_url = f"{scheme}://{self.host}{port}{url}"
+
+            if _is_own_url(full_url, config) or _is_excluded(full_url, config):
+                return original(self, method, url, **kwargs)
+
+            req_headers = kwargs.get("headers") or {}
+            req_body    = kwargs.get("body")
+            start       = time.time()
+
+            # ── Flow 1: Validation (with piggybacked metric) ───────────────
+            if config.enable_validation:
+                pending = None
+                if config.enable_ingest:
+                    pending = build_metric(
+                        library="urllib3",
+                        method=method, url=full_url,
+                        start_time=start,
+                        response=None, error=None,
+                        config=config,
+                        request_headers=req_headers,
+                        request_body=req_body,
+                    )
+
+                result = validator.check(
+                    method=method, url=full_url,
+                    headers=req_headers,
+                    pending_metric=pending,
+                )
+                if not result.allowed:
+                    return _blocked_response(result, log)
+
+            # ── Execute the actual request ─────────────────────────────────
+            response = error = None
+            try:
+                response = original(self, method, url, **kwargs)
+                return response
+            except Exception as exc:
+                error = exc
+                raise
+            finally:
+                if not config.enable_validation and config.enable_ingest:
+                    metric = build_metric(
+                        library="urllib3",
+                        method=method, url=full_url,
+                        start_time=start,
+                        response=response, error=error,
+                        config=config,
+                        request_headers=req_headers,
+                        request_body=req_body,
+                    )
+                    if metric:
+                        sender.add_metric(metric)
+
+        urllib3.HTTPConnectionPool.urlopen                       = monitored
+        _originals[(urllib3.HTTPConnectionPool, "urlopen")]      = original
+        log.debug("Patched urllib3.HTTPConnectionPool.urlopen")
+        return True
+    except ImportError:
+        return False
